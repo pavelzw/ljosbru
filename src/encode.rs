@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::Args;
 use image::Luma;
 use indicatif::{ProgressBar, ProgressStyle};
 use qrcode::{EcLevel, QrCode, Version, bits::Bits};
@@ -23,8 +23,8 @@ const MIN_ZSTD_LEVEL: u32 = 1;
 const MAX_ZSTD_LEVEL: u32 = 22;
 const QR_MODULE_PIXELS: u32 = 8;
 
-#[derive(Debug, Parser)]
-pub(crate) struct EncodeArgs {
+#[derive(Debug, Args)]
+pub struct EncodeArgs {
     filename: PathBuf,
 
     #[arg(
@@ -109,7 +109,7 @@ struct EncodeSummary {
 
 type CleanupConfirmation = fn(&Path, usize) -> anyhow::Result<bool>;
 
-pub(crate) fn encode(args: EncodeArgs) -> anyhow::Result<()> {
+pub fn encode(args: EncodeArgs) -> anyhow::Result<()> {
     let confirm_cleanup = cleanup_confirmation_for(&args);
     let summary = encode_with_cleanup(args, confirm_cleanup)?;
     println!(
@@ -388,7 +388,15 @@ where
 mod tests {
     use std::io::Cursor;
 
+    use clap::Parser;
+
     use super::*;
+
+    #[derive(Debug, Parser)]
+    struct EncodeCli {
+        #[command(flatten)]
+        args: EncodeArgs,
+    }
 
     #[test]
     fn parses_compression_modes() {
@@ -414,15 +422,18 @@ mod tests {
 
     #[test]
     fn encode_cli_defaults_to_no_compression() {
-        let args = EncodeArgs::try_parse_from(["encode", "input.bin", "--qr-size", "128"]).unwrap();
+        let args = EncodeCli::try_parse_from(["encode", "input.bin", "--qr-size", "128"])
+            .unwrap()
+            .args;
         assert_eq!(args.compression, Compression::None);
         assert!(!args.yes);
     }
 
     #[test]
     fn encode_cli_yes_selects_auto_cleanup_confirmation() {
-        let args = EncodeArgs::try_parse_from(["encode", "input.bin", "--qr-size", "128", "--yes"])
+        let args = EncodeCli::try_parse_from(["encode", "input.bin", "--qr-size", "128", "--yes"])
             .unwrap();
+        let args = args.args;
 
         assert!(args.yes);
         assert!(cleanup_confirmation_for(&args)(Path::new("output"), 1).unwrap());

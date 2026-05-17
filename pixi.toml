@@ -7,8 +7,8 @@ platforms = ["osx-arm64", "linux-64"]
 exclude-newer = "7d"
 
 [tasks]
-build = "cargo build"
-test = "cargo test"
+build = "cargo build --features decode"
+test = "cargo test --features decode"
 
 [dependencies]
 rust = "*"

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::Args;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -25,8 +25,8 @@ const DEFAULT_RETRY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_INITIAL_DELAY_MS: u64 = 1_000;
 const CACHE_EXTENSION: &str = "ljosbru-frame";
 
-#[derive(Debug, Parser)]
-pub(crate) struct DecodeArgs {
+#[derive(Debug, Args)]
+pub struct DecodeArgs {
     #[arg(long, value_name = "milliseconds")]
     delay_between: u64,
 
@@ -63,8 +63,8 @@ pub(crate) struct DecodeArgs {
     save_screenshots: bool,
 }
 
-#[derive(Debug, Parser)]
-pub(crate) struct PrintMissingArgs {
+#[derive(Debug, Args)]
+pub struct PrintMissingArgs {
     #[arg(long, value_name = "directory")]
     cache_dir: PathBuf,
 }
@@ -75,7 +75,7 @@ fn parse_enigo_key(value: &str) -> anyhow::Result<Key> {
         .context("expected a key name, such as `Space`, `Tab`, or `RightArrow`")
 }
 
-pub(crate) fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
+pub fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
     let store = FrameStore::load(&args.cache_dir)?;
     let width = store.sequence_width()?;
     for range in missing_sequence_ranges(&store.missing_sequences()?) {
@@ -84,7 +84,7 @@ pub(crate) fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode(args: DecodeArgs) -> anyhow::Result<()> {
+pub fn decode(args: DecodeArgs) -> anyhow::Result<()> {
     let mut store = FrameStore::load(&args.cache_dir)?;
     debug!(
         "Loaded {} cached QR frame(s){} from {}",
@@ -815,6 +815,12 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Parser)]
+    struct DecodeCli {
+        #[command(flatten)]
+        args: DecodeArgs,
+    }
+
     fn test_frame(
         sequence: u32,
         total_chunks: u32,
@@ -836,7 +842,7 @@ mod tests {
 
     #[test]
     fn decode_cli_parses_monitor_and_retry_defaults() {
-        let args = DecodeArgs::try_parse_from([
+        let args = DecodeCli::try_parse_from([
             "decode",
             "--delay-between",
             "250",
@@ -847,14 +853,15 @@ mod tests {
             "--output",
             "out.bin",
         ])
-        .unwrap();
+        .unwrap()
+        .args;
 
         assert_eq!(args.monitor, None);
         assert_eq!(args.initial_delay, DEFAULT_INITIAL_DELAY_MS);
         assert_eq!(args.retry_timeout, DEFAULT_RETRY_TIMEOUT_MS);
         assert!(!args.save_screenshots);
 
-        let args = DecodeArgs::try_parse_from([
+        let args = DecodeCli::try_parse_from([
             "decode",
             "--delay-between",
             "250",
@@ -872,7 +879,8 @@ mod tests {
             "1000",
             "--save-screenshots",
         ])
-        .unwrap();
+        .unwrap()
+        .args;
 
         assert_eq!(args.monitor, Some(2));
         assert_eq!(args.initial_delay, 2_000);

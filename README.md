@@ -27,15 +27,23 @@ available path between two machines is a screen and an automated screenshot loop
 From source:
 
 ```sh
-cargo build --release
-./target/release/ljosbru --help
+cargo build --release --features decode
+./target/release/ljosbru-encode --help
+./target/release/ljosbru-decode --help
+```
+
+The encoder can be built without the native zbar dependency:
+
+```sh
+cargo build --release --bin ljosbru-encode
 ```
 
 If installed from conda-forge:
 
 ```sh
 pixi global install -c conda-forge ljosbru
-ljosbru --help
+ljosbru-encode --help
+ljosbru-decode --help
 ```
 
 ## Encode
@@ -43,7 +51,7 @@ ljosbru --help
 Create QR images from a file:
 
 ```sh
-ljosbru encode examples/input.bin \
+ljosbru-encode examples/input.bin \
   --qr-size 1200 \
   --compression zstd:3 \
   --output ljosbru-output \
@@ -72,7 +80,7 @@ Show the generated QR images on a monitor, for example in a slide deck or image
 viewer where one keypress advances to the next image. Then run:
 
 ```sh
-ljosbru decode \
+ljosbru-decode \
   --delay-between 100 \
   --forward-keypress RightArrow \
   --cache-dir ljosbru-cache \
@@ -108,12 +116,13 @@ Accessibility permission for automated keypresses.
 ## Resume And Inspect Missing Frames
 
 The cache makes decode resumable. If decoding stops part-way through, rerun the
-same `decode` command with the same `--cache-dir`; existing frames are reused.
+same `ljosbru-decode` command with the same `--cache-dir`; existing frames are
+reused.
 
 To print missing frame IDs:
 
 ```sh
-ljosbru print-missing --cache-dir ljosbru-cache
+ljosbru-decode print-missing --cache-dir ljosbru-cache
 ```
 
 Output is zero-padded and grouped into ranges:
@@ -128,7 +137,7 @@ Output is zero-padded and grouped into ranges:
 Normal runs keep logs quiet. Enable detailed decoder logs with:
 
 ```sh
-RUST_LOG=debug ljosbru decode \
+RUST_LOG=debug ljosbru-decode \
   --delay-between 100 \
   --forward-keypress RightArrow \
   --cache-dir ljosbru-cache \
@@ -144,10 +153,10 @@ Try a longer `--initial-delay`, a larger `--delay-between`, a different
 ## Development
 
 The decoder links against `zbar`, so install the native library before building
-or running tests.
+`ljosbru-decode` or running decode-feature tests.
 
 ```sh
 cargo fmt
-cargo test
+cargo test --features decode
 cargo clippy --all-targets --all-features -- -D warnings
 ```
