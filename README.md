@@ -32,7 +32,7 @@ cargo build --release --features decode
 ./target/release/ljosbru-decode --help
 ```
 
-The encoder can be built without the native zbar dependency:
+The encoder can be built without the QR scanning dependency:
 
 ```sh
 cargo build --release --bin ljosbru-encode
@@ -151,9 +151,6 @@ Try a longer `--initial-delay`, a larger `--delay-between`, a different
 `--monitor`, or a smaller `--qr-size` when generating the QR images.
 
 ## Development
-
-The decoder links against `zbar`, so install the native library before building
-`ljosbru-decode` or running decode-feature tests.
 
 ```sh
 cargo fmt

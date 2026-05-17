@@ -1,9 +1,7 @@
 [workspace]
 name = "ljosbru"
 channels = ["conda-forge"]
-# https://github.com/conda-forge/zbar-feedstock/issues/2 for win-64
-# TODO: add linux-aarch64 https://github.com/conda-forge/zbar-feedstock/pull/17
-platforms = ["osx-arm64", "linux-64"]
+platforms = ["osx-arm64", "linux-aarch64", "linux-64", "win-64"]
 exclude-newer = "7d"
 
 [tasks]
@@ -12,7 +10,6 @@ test = "cargo test --features decode"
 
 [dependencies]
 rust = "*"
-zbar = "*"
 pkg-config = "*"
 
 [target.linux.dependencies]
