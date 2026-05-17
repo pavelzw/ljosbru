@@ -14,7 +14,7 @@
 
 </div>
 
-# ljosbru
+# ljósbrú
 
 Transfer data through QR codes.
 
