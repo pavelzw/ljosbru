@@ -41,7 +41,7 @@ cargo build --release --bin ljosbru-encode
 If installed from conda-forge:
 
 ```sh
-pixi global install -c conda-forge ljosbru
+pixi global install -c conda-forge ljosbru-encode ljosbru-decode
 ljosbru-encode --help
 ljosbru-decode --help
 ```
