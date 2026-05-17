@@ -1,7 +1,7 @@
 [package]
 name = "ljosbru"
 description = "Transfer data through QR codes"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 
 [features]
@@ -35,7 +35,9 @@ qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 rxing = { version = "0.8.6", default-features = false, features = [
   "encoding_rs",
 ], optional = true }
-xcap = { version = "0.9.4", optional = true }
+# https://github.com/nashaofu/xcap/issues/275
+# xcap = { version = "0.9.4", optional = true }
+xcap = { git = "https://github.com/pavelzw/xcap", branch = "video-recorder-feature", default-features = false, optional = true }
 zstd = "0.13.3"
 
 [dev-dependencies]
