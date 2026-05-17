@@ -4,6 +4,19 @@ description = "Transfer data through QR codes"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+default = []
+decode = ["dep:enigo", "dep:serde", "dep:sha2", "dep:xcap", "dep:rxing"]
+
+[[bin]]
+name = "ljosbru-encode"
+path = "src/bin/ljosbru-encode.rs"
+
+[[bin]]
+name = "ljosbru-decode"
+path = "src/bin/ljosbru-decode.rs"
+required-features = ["decode"]
+
 [dependencies]
 anyhow = "1.0.102"
 blake3 = "1.5.5"
@@ -14,13 +27,15 @@ human_bytes = "0.4.3"
 indicatif = "0.18.4"
 log = "0.4.29"
 rayon = "1.12.0"
-serde = "1.0.228"
-sha2 = "0.10.9"
+serde = { version = "1.0.228", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 thiserror = "2.0.18"
-enigo = { version = "0.6.1", features = ["serde"] }
+enigo = { version = "0.6.1", features = ["serde"], optional = true }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
-xcap = "0.9.4"
-zbar-rust = "0.0.24"
+rxing = { version = "0.8.6", default-features = false, features = [
+  "encoding_rs",
+], optional = true }
+xcap = { version = "0.9.4", optional = true }
 zstd = "0.13.3"
 
 [dev-dependencies]

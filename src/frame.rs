@@ -1,6 +1,7 @@
 use std::fmt;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::bail;
 
 pub(crate) const MAGIC: &[u8; 8] = b"LJOSBRU1";
 pub(crate) const VERSION: u8 = 1;
@@ -21,6 +22,7 @@ impl FrameCompression {
         }
     }
 
+    #[cfg(any(feature = "decode", test))]
     fn from_code(code: u8) -> anyhow::Result<Self> {
         match code {
             0 => Ok(Self::None),
@@ -87,6 +89,7 @@ pub(crate) fn build_frame(frame: Frame) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(any(feature = "decode", test))]
 pub(crate) fn parse_frame(bytes: &[u8]) -> anyhow::Result<Frame> {
     if bytes.len() < HEADER_LEN {
         bail!(

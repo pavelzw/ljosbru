@@ -8,6 +8,7 @@ pub(crate) fn human_bytes_per_second(bytes_per_second: f64) -> String {
     }
 }
 
+#[cfg(any(feature = "decode", test))]
 pub(crate) fn human_eta(remaining_bytes: u64, bytes_per_second: f64) -> String {
     if remaining_bytes == 0 {
         return "0:00".to_owned();
@@ -20,6 +21,7 @@ pub(crate) fn human_eta(remaining_bytes: u64, bytes_per_second: f64) -> String {
     format_duration((remaining_bytes as f64 / bytes_per_second).ceil() as u64)
 }
 
+#[cfg(any(feature = "decode", test))]
 fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;

@@ -8,15 +8,20 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::Args;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-use image::DynamicImage;
+use image::{DynamicImage, RgbaImage};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::debug;
+use rxing::{
+    BarcodeFormat, BinaryBitmap, DecodeHintValue, DecodeHints, Luma8LuminanceSource,
+    MultiFormatReader, RXingResult, RXingResultMetadataType, RXingResultMetadataValue,
+    common::HybridBinarizer,
+    multi::{GenericMultipleBarcodeReader, MultipleBarcodeReader},
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use xcap::Monitor;
-use zbar_rust::{ZBarImageScanner, ZBarSymbolType};
 
 use crate::frame::{Frame, FrameCompression, HEADER_LEN, MAGIC, build_frame, parse_frame};
 use crate::progress::{human_bytes_per_second, human_eta};
@@ -25,8 +30,8 @@ const DEFAULT_RETRY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_INITIAL_DELAY_MS: u64 = 1_000;
 const CACHE_EXTENSION: &str = "ljosbru-frame";
 
-#[derive(Debug, Parser)]
-pub(crate) struct DecodeArgs {
+#[derive(Debug, Args)]
+pub struct DecodeArgs {
     #[arg(long, value_name = "milliseconds")]
     delay_between: u64,
 
@@ -63,8 +68,8 @@ pub(crate) struct DecodeArgs {
     save_screenshots: bool,
 }
 
-#[derive(Debug, Parser)]
-pub(crate) struct PrintMissingArgs {
+#[derive(Debug, Args)]
+pub struct PrintMissingArgs {
     #[arg(long, value_name = "directory")]
     cache_dir: PathBuf,
 }
@@ -75,7 +80,7 @@ fn parse_enigo_key(value: &str) -> anyhow::Result<Key> {
         .context("expected a key name, such as `Space`, `Tab`, or `RightArrow`")
 }
 
-pub(crate) fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
+pub fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
     let store = FrameStore::load(&args.cache_dir)?;
     let width = store.sequence_width()?;
     for range in missing_sequence_ranges(&store.missing_sequences()?) {
@@ -84,7 +89,7 @@ pub(crate) fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode(args: DecodeArgs) -> anyhow::Result<()> {
+pub fn decode(args: DecodeArgs) -> anyhow::Result<()> {
     let mut store = FrameStore::load(&args.cache_dir)?;
     debug!(
         "Loaded {} cached QR frame(s){} from {}",
@@ -127,7 +132,7 @@ pub(crate) fn decode(args: DecodeArgs) -> anyhow::Result<()> {
         cache_dir: &args.cache_dir,
         save_screenshots: args.save_screenshots,
     };
-    let mut scanner = ZBarImageScanner::new();
+    let mut scanner = RxingScanner::new();
     let mut capture = CaptureContext {
         monitor: &selected_monitor.monitor,
         scanner: &mut scanner,
@@ -408,7 +413,7 @@ fn format_sequences(sequences: &[u32]) -> String {
 
 struct CaptureContext<'a> {
     monitor: &'a Monitor,
-    scanner: &'a mut ZBarImageScanner,
+    scanner: &'a mut RxingScanner,
     screenshot_options: ScreenshotOptions<'a>,
 }
 
@@ -426,7 +431,7 @@ impl CaptureContext<'_> {
             debug!("saved screenshot {}", path.display());
         }
 
-        decode_ljosbru_frames_with_zbar(self.scanner, screenshot)
+        self.scanner.decode_ljosbru_frames(screenshot)
     }
 }
 
@@ -448,50 +453,102 @@ fn screenshot_filename(timestamp: u128) -> String {
     format!("{timestamp}-screenshot.png")
 }
 
-fn decode_ljosbru_frames_with_zbar(
-    scanner: &mut ZBarImageScanner,
-    screenshot: image::RgbaImage,
-) -> anyhow::Result<Vec<Frame>> {
-    let width = screenshot.width();
-    let height = screenshot.height();
-    let image = DynamicImage::ImageRgba8(screenshot).to_luma8();
-    let results = scanner
-        .scan_y800(image.into_raw(), width, height)
-        .map_err(|error| anyhow::anyhow!("zbar failed to scan screenshot: {error}"))?;
-
-    let frames = results
-        .into_iter()
-        .filter(|result| result.symbol_type == ZBarSymbolType::ZBarQRCode)
-        .flat_map(|result| parse_zbar_output(&result.data))
-        .collect::<Vec<_>>();
-    if frames.is_empty() {
-        debug!("zbar found no ljosbru QR frames");
-    } else {
-        debug!(
-            "zbar decoded ljosbru sequence(s) {}",
-            format_sequences(
-                &frames
-                    .iter()
-                    .map(|frame| frame.sequence)
-                    .collect::<Vec<_>>()
-            )
-        );
-    }
-    Ok(frames)
+struct RxingScanner {
+    reader: GenericMultipleBarcodeReader<MultiFormatReader>,
+    hints: DecodeHints,
 }
 
-fn parse_zbar_output(output: &[u8]) -> Vec<Frame> {
-    let mut frames = parse_frames_from_bytes(output);
-    if frames.is_empty()
-        && let Some(decoded) = decode_zbar_text(output)
-    {
-        frames = parse_frames_from_bytes(&decoded);
+impl RxingScanner {
+    fn new() -> Self {
+        let hints = DecodeHints::default()
+            .with(DecodeHintValue::PossibleFormats(
+                [BarcodeFormat::QR_CODE].into(),
+            ))
+            .with(DecodeHintValue::TryHarder(true));
+        Self {
+            reader: GenericMultipleBarcodeReader::new(MultiFormatReader::default()),
+            hints,
+        }
+    }
+
+    fn decode_ljosbru_frames(&mut self, screenshot: RgbaImage) -> anyhow::Result<Vec<Frame>> {
+        let width = screenshot.width();
+        let height = screenshot.height();
+        let image = DynamicImage::ImageRgba8(screenshot).to_luma8();
+        let source = Luma8LuminanceSource::new(image.into_raw(), width, height);
+        let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
+        let results = match self
+            .reader
+            .decode_multiple_with_hints(&mut bitmap, &self.hints)
+        {
+            Ok(results) => results,
+            Err(error) => {
+                debug!("rxing found no ljosbru QR frames: {error}");
+                return Ok(Vec::new());
+            }
+        };
+
+        let frames = results
+            .into_iter()
+            .filter_map(|result| {
+                if result.getBarcodeFormat() == &BarcodeFormat::QR_CODE {
+                    Some(parse_rxing_result(&result))
+                } else {
+                    debug!(
+                        "rxing decoded non-QR barcode format {}",
+                        result.getBarcodeFormat()
+                    );
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            debug!("rxing found no ljosbru QR frames");
+        } else {
+            debug!(
+                "rxing decoded ljosbru sequence(s) {}",
+                format_sequences(
+                    &frames
+                        .iter()
+                        .map(|frame| frame.sequence)
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+        Ok(frames)
+    }
+}
+
+fn parse_rxing_result(result: &RXingResult) -> Vec<Frame> {
+    let mut frames = parse_rxing_byte_segments(result);
+    if frames.is_empty() {
+        frames = parse_frames_from_bytes(result.getRawBytes());
+    }
+    if frames.is_empty() {
+        frames = parse_frames_from_text(result.getText());
     }
     frames
 }
 
-fn decode_zbar_text(output: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(output).ok()?;
+fn parse_rxing_byte_segments(result: &RXingResult) -> Vec<Frame> {
+    let Some(RXingResultMetadataValue::ByteSegments(segments)) = result
+        .getRXingResultMetadata()
+        .get(&RXingResultMetadataType::BYTE_SEGMENTS)
+    else {
+        return Vec::new();
+    };
+
+    parse_frames_from_bytes(&segments.concat())
+}
+
+fn parse_frames_from_text(text: &str) -> Vec<Frame> {
+    parse_text_as_bytes(text)
+        .map(|decoded| parse_frames_from_bytes(&decoded))
+        .unwrap_or_default()
+}
+
+fn parse_text_as_bytes(text: &str) -> Option<Vec<u8>> {
     let mut decoded = Vec::with_capacity(text.len());
     for character in text.chars() {
         let value = u32::from(character);
@@ -812,8 +869,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use image::Luma;
+    use qrcode::{EcLevel, QrCode, Version, bits::Bits};
 
     use super::*;
+
+    #[derive(Debug, Parser)]
+    struct DecodeCli {
+        #[command(flatten)]
+        args: DecodeArgs,
+    }
 
     fn test_frame(
         sequence: u32,
@@ -834,9 +899,32 @@ mod tests {
         }
     }
 
+    fn test_qr_image(bytes: &[u8]) -> RgbaImage {
+        for version in 1..=40 {
+            let mut bits = Bits::new(Version::Normal(version));
+            if bits
+                .push_byte_data(bytes)
+                .and_then(|_| bits.push_terminator(EcLevel::M))
+                .is_ok()
+            {
+                return DynamicImage::ImageLuma8(
+                    QrCode::with_bits(bits, EcLevel::M)
+                        .unwrap()
+                        .render::<Luma<u8>>()
+                        .quiet_zone(true)
+                        .module_dimensions(8, 8)
+                        .build(),
+                )
+                .to_rgba8();
+            }
+        }
+
+        panic!("test QR payload does not fit");
+    }
+
     #[test]
     fn decode_cli_parses_monitor_and_retry_defaults() {
-        let args = DecodeArgs::try_parse_from([
+        let args = DecodeCli::try_parse_from([
             "decode",
             "--delay-between",
             "250",
@@ -847,14 +935,15 @@ mod tests {
             "--output",
             "out.bin",
         ])
-        .unwrap();
+        .unwrap()
+        .args;
 
         assert_eq!(args.monitor, None);
         assert_eq!(args.initial_delay, DEFAULT_INITIAL_DELAY_MS);
         assert_eq!(args.retry_timeout, DEFAULT_RETRY_TIMEOUT_MS);
         assert!(!args.save_screenshots);
 
-        let args = DecodeArgs::try_parse_from([
+        let args = DecodeCli::try_parse_from([
             "decode",
             "--delay-between",
             "250",
@@ -872,7 +961,8 @@ mod tests {
             "1000",
             "--save-screenshots",
         ])
-        .unwrap();
+        .unwrap()
+        .args;
 
         assert_eq!(args.monitor, Some(2));
         assert_eq!(args.initial_delay, 2_000);
@@ -881,27 +971,53 @@ mod tests {
     }
 
     #[test]
-    fn parses_zbar_output_with_trailing_newline() {
+    fn parses_frame_bytes_with_trailing_newline() {
         let encoded = b"hello world";
         let frame = test_frame(1, 1, 11, encoded, encoded, FrameCompression::None);
         let mut output = build_frame(frame.clone()).unwrap();
         output.push(b'\n');
 
-        assert_eq!(parse_zbar_output(&output), vec![frame]);
+        assert_eq!(parse_frames_from_bytes(&output), vec![frame]);
     }
 
     #[test]
-    fn parses_zbar_utf8_transcoded_output() {
+    fn parses_rxing_byte_segments() {
+        let encoded = b"hello world";
+        let frame = test_frame(1, 1, 11, encoded, encoded, FrameCompression::None);
+        let output = build_frame(frame.clone()).unwrap();
+        let mut result = RXingResult::new("", Vec::new(), Vec::new(), BarcodeFormat::QR_CODE);
+        result.putMetadata(
+            RXingResultMetadataType::BYTE_SEGMENTS,
+            RXingResultMetadataValue::ByteSegments(vec![output]),
+        );
+
+        assert_eq!(parse_rxing_result(&result), vec![frame]);
+    }
+
+    #[test]
+    fn rxing_scanner_decodes_ljosbru_qr_frame() {
+        let encoded = &[0xeb, 0x4d, 0xa0, 0x62];
+        let frame = test_frame(1, 1, 4, encoded, encoded, FrameCompression::None);
+        let qr_image = test_qr_image(&build_frame(frame.clone()).unwrap());
+        let mut scanner = RxingScanner::new();
+
+        assert_eq!(
+            scanner.decode_ljosbru_frames(qr_image).unwrap(),
+            vec![frame]
+        );
+    }
+
+    #[test]
+    fn parses_rxing_utf8_transcoded_text() {
         let encoded = &[0xeb, 0x4d, 0xa0, 0x62];
         let frame = test_frame(1, 1, 4, encoded, encoded, FrameCompression::None);
         let bytes = build_frame(frame.clone()).unwrap();
-        let output = bytes
+        let text = bytes
             .iter()
             .map(|byte| char::from(*byte))
-            .collect::<String>()
-            .into_bytes();
+            .collect::<String>();
 
-        assert_eq!(parse_zbar_output(&output), vec![frame]);
+        assert_eq!(parse_frames_from_text(&text), vec![frame]);
     }
 
     #[test]
