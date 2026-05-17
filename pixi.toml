@@ -16,6 +16,7 @@ pkg-config = "*"
 compilers = ">=1.7.0"
 wayland = "*"
 libegl-devel = "*"
+libgbm = "*"
 
 [feature.lint.dependencies]
 pre-commit = "*"
