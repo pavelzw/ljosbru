@@ -4,11 +4,12 @@ use std::{
     path::PathBuf,
     str::FromStr,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use clap::Args;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use self::{
     emit::{EmissionPlan, FrameEmitter},
@@ -17,6 +18,7 @@ use self::{
     transfer::{EncodedFrame, Transfer},
 };
 use crate::frame::FrameCompression;
+use crate::progress::human_bytes_per_second;
 
 mod emit;
 mod png;
@@ -55,6 +57,13 @@ pub struct EncodeArgs {
 
     #[arg(long, help = "Delete existing output PNG files without prompting")]
     yes: bool,
+
+    #[arg(
+        long,
+        value_name = "auto|none|enter|delay:<milliseconds>",
+        default_value = "auto"
+    )]
+    wait: WaitArg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +120,37 @@ impl FromStr for Compression {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitArg {
+    Auto,
+    None,
+    Enter,
+    Delay(Duration),
+}
+
+impl FromStr for WaitArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => return Ok(Self::Auto),
+            "none" => return Ok(Self::None),
+            "enter" => return Ok(Self::Enter),
+            _ => {}
+        }
+
+        let Some(milliseconds) = value.strip_prefix("delay:") else {
+            return Err("expected `auto`, `none`, `enter`, or `delay:<milliseconds>`".to_owned());
+        };
+
+        let milliseconds = milliseconds
+            .parse()
+            .map_err(|_| "expected delay milliseconds to be an integer".to_owned())?;
+
+        Ok(Self::Delay(Duration::from_millis(milliseconds)))
+    }
+}
+
 enum WaitMode<'a> {
     None,
     Input {
@@ -120,6 +160,7 @@ enum WaitMode<'a> {
     Delay(Duration),
 }
 
+#[derive(Debug)]
 enum WaitModeSelection {
     None,
     Input,
@@ -127,20 +168,27 @@ enum WaitModeSelection {
 }
 
 impl WaitModeSelection {
-    fn from_args(args: &EncodeArgs) -> Self {
-        Self::from_options(
-            args.terminal && io::stdin().is_terminal() && io::stdout().is_terminal(),
-            None,
+    fn from_args(args: &EncodeArgs) -> anyhow::Result<Self> {
+        let stdin_is_terminal = io::stdin().is_terminal();
+        let stdout_is_terminal = io::stdout().is_terminal();
+        Self::from_wait_arg(
+            &args.wait,
+            args.terminal && stdin_is_terminal && stdout_is_terminal,
+            stdin_is_terminal,
         )
     }
 
-    fn from_options(input_enabled: bool, delay: Option<Duration>) -> Self {
-        if let Some(duration) = delay {
-            Self::Delay(duration)
-        } else if input_enabled {
-            Self::Input
-        } else {
-            Self::None
+    fn from_wait_arg(
+        wait: &WaitArg,
+        auto_input_enabled: bool,
+        input_available: bool,
+    ) -> anyhow::Result<Self> {
+        match wait {
+            WaitArg::Auto if auto_input_enabled => Ok(Self::Input),
+            WaitArg::Auto | WaitArg::None => Ok(Self::None),
+            WaitArg::Enter if input_available => Ok(Self::Input),
+            WaitArg::Enter => anyhow::bail!("--wait enter requires interactive stdin"),
+            WaitArg::Delay(duration) => Ok(Self::Delay(*duration)),
         }
     }
 }
@@ -181,6 +229,96 @@ trait QrSink {
     fn prepare(&mut self) -> anyhow::Result<()>;
     fn emit_batch(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()>;
     fn finish(&mut self) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressDisplay {
+    Bar,
+    Line,
+}
+
+struct EncodeProgress {
+    progress: Option<ProgressBar>,
+    started_at: Instant,
+    display: ProgressDisplay,
+    total_chunks: usize,
+    emitted_chunks: usize,
+    payload_bytes: u64,
+}
+
+impl EncodeProgress {
+    fn new(total_chunks: usize, display: ProgressDisplay) -> anyhow::Result<Self> {
+        let progress = if display == ProgressDisplay::Bar {
+            let progress = ProgressBar::new(total_chunks as u64);
+            progress.set_style(
+                ProgressStyle::with_template(
+                    "Encoding QR codes [{bar:40.cyan/blue}] {pos}/{len} {msg} ({elapsed_precise})",
+                )
+                .context("failed to configure encode progress bar")?
+                .progress_chars("##-"),
+            );
+            progress.set_message(human_bytes_per_second(0.0));
+            Some(progress)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            progress,
+            started_at: Instant::now(),
+            display,
+            total_chunks,
+            emitted_chunks: 0,
+            payload_bytes: 0,
+        })
+    }
+
+    fn suspend<R>(&self, action: impl FnOnce() -> R) -> R {
+        if let Some(progress) = &self.progress {
+            progress.suspend(action)
+        } else {
+            action()
+        }
+    }
+
+    fn inc(&mut self, frames: usize, payload_bytes: usize) {
+        self.emitted_chunks += frames;
+        self.payload_bytes += payload_bytes as u64;
+        let bytes_per_second =
+            self.payload_bytes as f64 / self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let speed = human_bytes_per_second(bytes_per_second);
+
+        if let Some(progress) = &self.progress {
+            progress.inc(frames as u64);
+            progress.set_message(speed);
+        } else if self.display == ProgressDisplay::Line {
+            eprintln!(
+                "{}",
+                encode_progress_line(self.emitted_chunks, self.total_chunks, &speed)
+            );
+        }
+    }
+
+    fn finish(self) {
+        if let Some(progress) = self.progress {
+            progress.finish_and_clear();
+        }
+    }
+}
+
+fn encode_progress_line(emitted_chunks: usize, total_chunks: usize, speed: &str) -> String {
+    const BAR_WIDTH: usize = 40;
+
+    let total_chunks = total_chunks.max(1);
+    let filled = (emitted_chunks * BAR_WIDTH / total_chunks).min(BAR_WIDTH);
+    format!(
+        "Encoding QR codes [{}{}] {}/{} {}",
+        "#".repeat(filled),
+        "-".repeat(BAR_WIDTH - filled),
+        emitted_chunks,
+        total_chunks,
+        speed
+    )
 }
 
 fn get_sink(args: &EncodeArgs, transfer: &Transfer) -> Box<dyn QrSink> {
@@ -255,22 +393,27 @@ fn run_encode(args: EncodeArgs) -> anyhow::Result<EncodeSummary> {
 
 fn create_qr_codes_for_args(args: &EncodeArgs, transfer: &Transfer) -> anyhow::Result<usize> {
     let mut sink = get_sink(args, transfer);
+    let progress_display = if args.terminal {
+        ProgressDisplay::Line
+    } else {
+        ProgressDisplay::Bar
+    };
 
-    match WaitModeSelection::from_args(args) {
+    match WaitModeSelection::from_args(args)? {
         WaitModeSelection::None => {
             let mut wait_mode = WaitMode::None;
-            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode)
+            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode, progress_display)
         }
         WaitModeSelection::Input => {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
             let mut stderr = io::stderr();
             let mut wait_mode = WaitMode::input(&mut stdin, &mut stderr);
-            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode)
+            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode, progress_display)
         }
         WaitModeSelection::Delay(duration) => {
             let mut wait_mode = WaitMode::Delay(duration);
-            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode)
+            create_qr_codes(transfer, sink.as_mut(), &mut wait_mode, progress_display)
         }
     }
 }
@@ -279,21 +422,27 @@ fn create_qr_codes(
     transfer: &Transfer,
     sink: &mut dyn QrSink,
     wait_mode: &mut WaitMode<'_>,
+    progress_display: ProgressDisplay,
 ) -> anyhow::Result<usize> {
     sink.prepare()?;
 
     let plan = EmissionPlan::single_frames();
     let mut emitter = FrameEmitter::new(transfer, &plan);
+    let mut progress = EncodeProgress::new(transfer.chunk_count(), progress_display)?;
     let mut emitted_count = 0;
 
     while let Some(batch) = emitter.next_batch()? {
         if emitted_count > 0 {
-            wait_mode.wait()?;
+            progress.suspend(|| wait_mode.wait())?;
         }
-        emitted_count += batch.len();
+        let batch_len = batch.len();
+        let payload_len = batch.iter().map(|frame| frame.payload_len).sum();
         sink.emit_batch(batch)?;
+        emitted_count += batch_len;
+        progress.inc(batch_len, payload_len);
     }
 
+    progress.finish();
     sink.finish()?;
     Ok(emitted_count)
 }
@@ -357,7 +506,12 @@ mod tests {
             } else {
                 WaitMode::None
             };
-            create_qr_codes(&transfer, sink.as_mut(), &mut wait_mode)?
+            create_qr_codes(
+                &transfer,
+                sink.as_mut(),
+                &mut wait_mode,
+                ProgressDisplay::Line,
+            )?
         };
 
         let summary = EncodeSummary {
@@ -401,8 +555,99 @@ mod tests {
             .unwrap()
             .args;
         assert_eq!(args.compression, Compression::None);
+        assert_eq!(args.wait, WaitArg::Auto);
         assert!(!args.terminal);
         assert!(!args.yes);
+    }
+
+    #[test]
+    fn encode_cli_parses_wait_modes() {
+        let args = EncodeCli::try_parse_from([
+            "encode",
+            "input.bin",
+            "--qr-size",
+            "128",
+            "--wait",
+            "none",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(args.wait, WaitArg::None);
+
+        let args = EncodeCli::try_parse_from([
+            "encode",
+            "input.bin",
+            "--qr-size",
+            "128",
+            "--wait",
+            "enter",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(args.wait, WaitArg::Enter);
+
+        let args = EncodeCli::try_parse_from([
+            "encode",
+            "input.bin",
+            "--qr-size",
+            "128",
+            "--wait",
+            "delay:500",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(args.wait, WaitArg::Delay(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn encode_cli_rejects_invalid_wait_modes() {
+        for wait in ["", "delay", "delay:", "delay:abc", "key:Space"] {
+            let error = EncodeCli::try_parse_from([
+                "encode",
+                "input.bin",
+                "--qr-size",
+                "128",
+                "--wait",
+                wait,
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn wait_selection_maps_cli_wait_modes() {
+        assert!(matches!(
+            WaitModeSelection::from_wait_arg(&WaitArg::Auto, true, true).unwrap(),
+            WaitModeSelection::Input
+        ));
+        assert!(matches!(
+            WaitModeSelection::from_wait_arg(&WaitArg::Auto, false, true).unwrap(),
+            WaitModeSelection::None
+        ));
+        assert!(matches!(
+            WaitModeSelection::from_wait_arg(&WaitArg::None, true, true).unwrap(),
+            WaitModeSelection::None
+        ));
+        assert!(matches!(
+            WaitModeSelection::from_wait_arg(&WaitArg::Enter, false, true).unwrap(),
+            WaitModeSelection::Input
+        ));
+        assert!(
+            WaitModeSelection::from_wait_arg(&WaitArg::Enter, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("interactive stdin")
+        );
+        assert!(matches!(
+            WaitModeSelection::from_wait_arg(
+                &WaitArg::Delay(Duration::from_millis(7)),
+                false,
+                false
+            )
+            .unwrap(),
+            WaitModeSelection::Delay(duration) if duration == Duration::from_millis(7)
+        ));
     }
 
     #[test]
@@ -455,6 +700,7 @@ mod tests {
             output: output.clone(),
             terminal: false,
             yes: false,
+            wait: WaitArg::Auto,
         })
         .unwrap_err();
 
@@ -478,6 +724,7 @@ mod tests {
             output: output.clone(),
             terminal: false,
             yes: false,
+            wait: WaitArg::Auto,
         })
         .unwrap_err();
 
@@ -502,6 +749,7 @@ mod tests {
             output: output.clone(),
             terminal: false,
             yes: true,
+            wait: WaitArg::Auto,
         })
         .unwrap();
 
@@ -534,6 +782,7 @@ mod tests {
                 output: output.clone(),
                 terminal: true,
                 yes: false,
+                wait: WaitArg::Auto,
             },
             &mut terminal_output,
         )
@@ -571,6 +820,7 @@ mod tests {
                 output,
                 terminal: true,
                 yes: false,
+                wait: WaitArg::Auto,
             },
             &mut terminal_output,
             &mut terminal_input,
@@ -595,5 +845,15 @@ mod tests {
         let mut wait_mode = WaitMode::Delay(Duration::ZERO);
 
         wait_mode.wait().unwrap();
+    }
+
+    #[test]
+    fn terminal_progress_line_shows_position_and_speed() {
+        let line = encode_progress_line(2, 4, "1 KiB/s");
+
+        assert_eq!(
+            line,
+            "Encoding QR codes [####################--------------------] 2/4 1 KiB/s"
+        );
     }
 }

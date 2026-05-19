@@ -82,7 +82,8 @@ where
             separate_frames(&mut self.writer)?;
         }
         self.first_batch = false;
-        self.write_frames(frames)
+        self.write_frames(frames)?;
+        self.finish()
     }
 
     fn finish(&mut self) -> anyhow::Result<()> {

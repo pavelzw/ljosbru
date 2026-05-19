@@ -1,17 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
 };
 
 use anyhow::{Context, bail};
 use image::Luma;
-use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
 
 use super::{QrSink, emit::byte_mode_qr_code, transfer::EncodedFrame};
-use crate::progress::human_bytes_per_second;
 
 const QR_MODULE_PIXELS: u32 = 8;
 
@@ -21,13 +16,6 @@ pub(super) struct PngSink {
     qr_size: usize,
     filename_width: usize,
     confirmation_mode: ConfirmationMode,
-    jobs: Vec<PngJob>,
-}
-
-#[derive(Debug)]
-struct PngJob {
-    frame: EncodedFrame,
-    output_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +46,6 @@ impl PngSink {
             qr_size,
             filename_width,
             confirmation_mode: ConfirmationMode::from_assume_yes(assume_cleanup),
-            jobs: Vec::new(),
         }
     }
 
@@ -73,13 +60,19 @@ impl PngSink {
                 frame.sequence,
                 width = self.filename_width
             ));
-            self.jobs.push(PngJob { frame, output_path });
+            write_qr_png(
+                &frame.bytes,
+                &output_path,
+                self.qr_size,
+                frame.sequence,
+                frame.total_chunks,
+            )?;
         }
         Ok(())
     }
 
     pub(super) fn finish(&mut self) -> anyhow::Result<()> {
-        write_png_jobs(&self.jobs, self.qr_size)
+        Ok(())
     }
 }
 
@@ -95,45 +88,6 @@ impl QrSink for PngSink {
     fn finish(&mut self) -> anyhow::Result<()> {
         PngSink::finish(self)
     }
-}
-
-fn write_png_jobs(jobs: &[PngJob], qr_size: usize) -> anyhow::Result<()> {
-    let progress = encode_progress_bar(jobs.len())?;
-    let started_at = Instant::now();
-    let payload_bytes_written = AtomicU64::new(0);
-
-    let write_result: anyhow::Result<()> = jobs.par_iter().try_for_each(|job| {
-        write_qr_png(
-            &job.frame.bytes,
-            &job.output_path,
-            qr_size,
-            job.frame.sequence,
-            job.frame.total_chunks,
-        )?;
-        let bytes_written = payload_bytes_written
-            .fetch_add(job.frame.payload_len as u64, Ordering::Relaxed)
-            + job.frame.payload_len as u64;
-        progress.set_message(human_bytes_per_second(
-            bytes_written as f64 / started_at.elapsed().as_secs_f64().max(f64::EPSILON),
-        ));
-        progress.inc(1);
-        Ok(())
-    });
-    progress.finish_and_clear();
-    write_result
-}
-
-fn encode_progress_bar(total_chunks: usize) -> anyhow::Result<ProgressBar> {
-    let progress = ProgressBar::new(total_chunks as u64);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "Writing QR codes [{bar:40.cyan/blue}] {pos}/{len} {msg} ({elapsed_precise})",
-        )
-        .context("failed to configure progress bar")?
-        .progress_chars("##-"),
-    );
-    progress.set_message(human_bytes_per_second(0.0));
-    Ok(progress)
 }
 
 fn write_qr_png(
