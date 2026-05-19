@@ -48,7 +48,8 @@ pub struct EncodeArgs {
         long,
         value_name = "directory",
         default_value = "./ljosbru-output/",
-        help = "Directory for generated PNGs; ignored with --terminal"
+        conflicts_with = "terminal",
+        help = "Directory for generated PNGs"
     )]
     output: PathBuf,
 
@@ -685,6 +686,22 @@ mod tests {
                 .unwrap()
                 .args;
         assert!(args.terminal);
+    }
+
+    #[test]
+    fn encode_cli_rejects_terminal_with_explicit_output() {
+        let error = EncodeCli::try_parse_from([
+            "encode",
+            "input.bin",
+            "--qr-size",
+            "128",
+            "--terminal",
+            "--output",
+            "out",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
