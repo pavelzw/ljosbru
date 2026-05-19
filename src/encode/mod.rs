@@ -198,6 +198,10 @@ impl<'a> WaitMode<'a> {
         Self::Input { reader, prompt }
     }
 
+    fn writes_prompt(&self) -> bool {
+        matches!(self, Self::Input { .. })
+    }
+
     fn wait(&mut self) -> anyhow::Result<()> {
         match self {
             Self::None => Ok(()),
@@ -235,6 +239,7 @@ trait QrSink {
 enum ProgressDisplay {
     Bar,
     Line,
+    None,
 }
 
 struct EncodeProgress {
@@ -331,6 +336,7 @@ fn get_sink(args: &EncodeArgs, transfer: &Transfer) -> Box<dyn QrSink> {
             args.output.clone(),
             args.qr_size,
             transfer.filename_width(),
+            transfer.chunk_count(),
             args.yes,
         ))
     }
@@ -396,7 +402,7 @@ fn create_qr_codes_for_args(args: &EncodeArgs, transfer: &Transfer) -> anyhow::R
     let progress_display = if args.terminal {
         ProgressDisplay::Line
     } else {
-        ProgressDisplay::Bar
+        ProgressDisplay::None
     };
 
     match WaitModeSelection::from_args(args)? {
@@ -433,7 +439,11 @@ fn create_qr_codes(
 
     while let Some(batch) = emitter.next_batch()? {
         if emitted_count > 0 {
-            progress.suspend(|| wait_mode.wait())?;
+            if wait_mode.writes_prompt() {
+                progress.suspend(|| wait_mode.wait())?;
+            } else {
+                wait_mode.wait()?;
+            }
         }
         let batch_len = batch.len();
         let payload_len = batch.iter().map(|frame| frame.payload_len).sum();

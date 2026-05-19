@@ -1,12 +1,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, bail};
 use image::Luma;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use super::{QrSink, emit::byte_mode_qr_code, transfer::EncodedFrame};
+use crate::progress::human_bytes_per_second;
 
 const QR_MODULE_PIXELS: u32 = 8;
 
@@ -15,7 +23,20 @@ pub(super) struct PngSink {
     output: PathBuf,
     qr_size: usize,
     filename_width: usize,
+    total_chunks: usize,
     confirmation_mode: ConfirmationMode,
+    result_sender: Option<mpsc::Sender<anyhow::Result<()>>>,
+    result_receiver: mpsc::Receiver<anyhow::Result<()>>,
+    progress: Option<ProgressBar>,
+    started_at: Option<Instant>,
+    payload_bytes_written: Arc<AtomicU64>,
+    pending_jobs: usize,
+}
+
+#[derive(Debug)]
+struct PngJob {
+    frame: EncodedFrame,
+    output_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,40 +60,116 @@ impl PngSink {
         output: PathBuf,
         qr_size: usize,
         filename_width: usize,
+        total_chunks: usize,
         assume_cleanup: bool,
     ) -> Self {
+        let (result_sender, result_receiver) = mpsc::channel();
         Self {
             output,
             qr_size,
             filename_width,
+            total_chunks,
             confirmation_mode: ConfirmationMode::from_assume_yes(assume_cleanup),
+            result_sender: Some(result_sender),
+            result_receiver,
+            progress: None,
+            started_at: None,
+            payload_bytes_written: Arc::new(AtomicU64::new(0)),
+            pending_jobs: 0,
         }
     }
 
     pub(super) fn prepare(&mut self) -> anyhow::Result<()> {
-        prepare_output_dir(&self.output, self.confirmation_mode)
+        prepare_output_dir(&self.output, self.confirmation_mode)?;
+
+        let progress = ProgressBar::new(self.total_chunks as u64);
+        progress.set_style(
+            ProgressStyle::with_template(
+                "Writing QR codes [{bar:40.cyan/blue}] {pos}/{len} {msg} ({elapsed_precise})",
+            )
+            .context("failed to configure PNG progress bar")?
+            .progress_chars("##-"),
+        );
+        progress.set_message(human_bytes_per_second(0.0));
+        self.progress = Some(progress);
+        self.started_at = Some(Instant::now());
+        Ok(())
     }
 
     pub(super) fn emit_batch(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()> {
+        let sender = self
+            .result_sender
+            .as_ref()
+            .context("PNG sink has already finished")?;
+        let progress = self
+            .progress
+            .as_ref()
+            .context("PNG sink was not prepared")?;
+        let started_at = self.started_at.context("PNG sink was not prepared")?;
+
         for frame in frames {
             let output_path = self.output.join(format!(
                 "{:0width$}.png",
                 frame.sequence,
                 width = self.filename_width
             ));
-            write_qr_png(
-                &frame.bytes,
-                &output_path,
-                self.qr_size,
-                frame.sequence,
-                frame.total_chunks,
-            )?;
+            let job = PngJob { frame, output_path };
+            let qr_size = self.qr_size;
+            let sender = sender.clone();
+            let progress = progress.clone();
+            let payload_bytes_written = Arc::clone(&self.payload_bytes_written);
+            self.pending_jobs += 1;
+
+            rayon::spawn(move || {
+                let payload_len = job.frame.payload_len;
+                let result = write_qr_png(
+                    &job.frame.bytes,
+                    &job.output_path,
+                    qr_size,
+                    job.frame.sequence,
+                    job.frame.total_chunks,
+                );
+                if result.is_ok() {
+                    let bytes_written = payload_bytes_written
+                        .fetch_add(payload_len as u64, Ordering::Relaxed)
+                        + payload_len as u64;
+                    progress.set_message(human_bytes_per_second(
+                        bytes_written as f64 / started_at.elapsed().as_secs_f64().max(f64::EPSILON),
+                    ));
+                }
+                progress.inc(1);
+                let _ = sender.send(result);
+            });
         }
         Ok(())
     }
 
     pub(super) fn finish(&mut self) -> anyhow::Result<()> {
-        Ok(())
+        self.result_sender.take();
+
+        let mut first_error = None;
+        for _ in 0..self.pending_jobs {
+            match self
+                .result_receiver
+                .recv()
+                .context("failed to receive PNG write result")?
+            {
+                Ok(()) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        self.pending_jobs = 0;
+
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -294,8 +391,10 @@ mod tests {
             output.clone(),
             HEADER_LEN + 5,
             transfer.filename_width(),
+            transfer.chunk_count(),
             true,
         );
+        sink.prepare().unwrap();
         let mut emitted = 0;
 
         while let Some(batch) = emitter.next_batch().unwrap() {
