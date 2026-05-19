@@ -13,7 +13,7 @@ use clap::Args;
 use self::{
     emit::{EmissionPlan, FrameEmitter},
     png::PngSink,
-    terminal::{TerminalScreenSink, TerminalStreamSink},
+    terminal::TerminalSink,
     transfer::{EncodedFrame, Transfer},
 };
 use crate::frame::FrameCompression;
@@ -186,11 +186,8 @@ trait QrSink {
 fn get_sink(args: &EncodeArgs, transfer: &Transfer) -> Box<dyn QrSink> {
     if args.terminal {
         let stdout = io::stdout();
-        if stdout.is_terminal() {
-            Box::new(TerminalScreenSink::new(stdout, args.qr_size))
-        } else {
-            Box::new(TerminalStreamSink::new(stdout, args.qr_size))
-        }
+        let clear_screen = stdout.is_terminal();
+        Box::new(TerminalSink::new(stdout, args.qr_size, clear_screen))
     } else {
         Box::new(PngSink::new(
             args.output.clone(),
@@ -346,17 +343,11 @@ mod tests {
         let compression = args.compression.clone();
         let transfer = Transfer::prepare(&args.filename, args.qr_size, args.compression.clone())?;
         let mut prompt_output = Vec::new();
-        let mut sink: Box<dyn QrSink + '_> = if wait_for_enter {
-            Box::new(TerminalScreenSink::new(
-                terminal_writer as &mut dyn Write,
-                args.qr_size,
-            ))
-        } else {
-            Box::new(TerminalStreamSink::new(
-                terminal_writer as &mut dyn Write,
-                args.qr_size,
-            ))
-        };
+        let mut sink: Box<dyn QrSink + '_> = Box::new(TerminalSink::new(
+            terminal_writer as &mut dyn Write,
+            args.qr_size,
+            wait_for_enter,
+        ));
         let emitted_count = {
             let mut wait_mode = if wait_for_enter {
                 WaitMode::input(

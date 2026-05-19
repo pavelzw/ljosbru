@@ -16,14 +16,7 @@ pub(super) const ANSI_CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 pub(super) struct TerminalSink<W> {
     writer: W,
     qr_size: usize,
-}
-
-pub(super) struct TerminalScreenSink<W> {
-    sink: TerminalSink<W>,
-}
-
-pub(super) struct TerminalStreamSink<W> {
-    sink: TerminalSink<W>,
+    clear_screen: bool,
     first_batch: bool,
 }
 
@@ -31,11 +24,16 @@ impl<W> TerminalSink<W>
 where
     W: Write,
 {
-    pub(super) fn new(writer: W, qr_size: usize) -> Self {
-        Self { writer, qr_size }
+    pub(super) fn new(writer: W, qr_size: usize, clear_screen: bool) -> Self {
+        Self {
+            writer,
+            qr_size,
+            clear_screen,
+            first_batch: true,
+        }
     }
 
-    pub(super) fn emit_batch(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()> {
+    fn write_frames(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()> {
         for (index, frame) in frames.into_iter().enumerate() {
             if index > 0 {
                 writeln!(self.writer).context("failed to write terminal QR separator")?;
@@ -69,18 +67,7 @@ where
     }
 }
 
-impl<W> TerminalScreenSink<W>
-where
-    W: Write,
-{
-    pub(super) fn new(writer: W, qr_size: usize) -> Self {
-        Self {
-            sink: TerminalSink::new(writer, qr_size),
-        }
-    }
-}
-
-impl<W> QrSink for TerminalScreenSink<W>
+impl<W> QrSink for TerminalSink<W>
 where
     W: Write,
 {
@@ -89,46 +76,17 @@ where
     }
 
     fn emit_batch(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()> {
-        clear_screen(&mut self.sink.writer)?;
-        self.sink.emit_batch(frames)
+        if self.clear_screen {
+            clear_screen(&mut self.writer)?;
+        } else if !self.first_batch {
+            separate_frames(&mut self.writer)?;
+        }
+        self.first_batch = false;
+        self.write_frames(frames)
     }
 
     fn finish(&mut self) -> anyhow::Result<()> {
-        self.sink.finish()
-    }
-}
-
-impl<W> TerminalStreamSink<W>
-where
-    W: Write,
-{
-    pub(super) fn new(writer: W, qr_size: usize) -> Self {
-        Self {
-            sink: TerminalSink::new(writer, qr_size),
-            first_batch: true,
-        }
-    }
-}
-
-impl<W> QrSink for TerminalStreamSink<W>
-where
-    W: Write,
-{
-    fn prepare(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn emit_batch(&mut self, frames: Vec<EncodedFrame>) -> anyhow::Result<()> {
-        if self.first_batch {
-            self.first_batch = false;
-        } else {
-            separate_frames(&mut self.sink.writer)?;
-        }
-        self.sink.emit_batch(frames)
-    }
-
-    fn finish(&mut self) -> anyhow::Result<()> {
-        self.sink.finish()
+        TerminalSink::finish(self)
     }
 }
 
