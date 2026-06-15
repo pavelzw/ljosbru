@@ -63,6 +63,20 @@ The QR payload contains ljosbru framing metadata: sequence number, total chunk
 count, original size, compressed size, compression mode, and a BLAKE3 hash of
 the encoded payload.
 
+To display QR codes directly in a terminal instead of writing PNG files:
+
+```sh
+ljosbru-encode examples/input.bin \
+  --qr-size 600 \
+  --compression zstd:3 \
+  --terminal
+```
+
+This prints ANSI-colored Unicode block QR codes to stdout one frame at a time.
+Press Enter to advance to the next frame. Terminal output leaves the output
+directory untouched. For scanning from a monitor, use a smaller `--qr-size` if
+the terminal cannot fit a whole frame clearly.
+
 Useful encode options:
 
 | Option | Description |
@@ -72,6 +86,7 @@ Useful encode options:
 | `--compression zstd` | Compress with zstd level 3. |
 | `--compression zstd:<level>` | Compress with a zstd level from 1 to 22. |
 | `--output <directory>` | Directory for generated PNGs. Defaults to `./ljosbru-output/`. |
+| `--terminal` | Print terminal QR codes to stdout instead of writing PNG files. |
 | `--yes` | Delete existing PNGs in the output directory without prompting. |
 
 ## Decode
