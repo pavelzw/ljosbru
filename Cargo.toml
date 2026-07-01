@@ -28,11 +28,11 @@ indicatif = "0.18.4"
 log = "0.4.29"
 rayon = "1.12.0"
 serde = { version = "1.0.228", optional = true }
-sha2 = { version = "0.10.9", optional = true }
+sha2 = { version = "0.11.0", optional = true }
 thiserror = "2.0.18"
 enigo = { version = "0.6.1", features = ["serde"], optional = true }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
-rxing = { version = "0.8.6", default-features = false, features = [
+rxing = { version = "0.9.1", default-features = false, features = [
   "encoding_rs",
 ], optional = true }
 # https://github.com/nashaofu/xcap/issues/275
