@@ -475,7 +475,8 @@ impl RxingScanner {
         let width = screenshot.width();
         let height = screenshot.height();
         let image = DynamicImage::ImageRgba8(screenshot).to_luma8();
-        let source = Luma8LuminanceSource::new(image.into_raw(), width, height);
+        let source = Luma8LuminanceSource::new(image.into_raw(), width, height)
+            .context("failed to create luminance source from screenshot")?;
         let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
         let results = match self
             .reader
