@@ -1,13 +1,13 @@
 [package]
 name = "ljosbru"
 description = "Transfer data through QR codes"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 [features]
 default = []
 decode = ["dep:enigo", "dep:serde", "dep:sha2", "dep:xcap", "dep:rxing"]
-gui = ["decode", "serde/derive", "dep:eframe", "dep:rfd"]
+gui = ["decode", "serde/derive", "dep:core-foundation", "dep:eframe", "dep:rfd"]
 
 [[bin]]
 name = "ljosbru-encode"
@@ -20,7 +20,7 @@ required-features = ["decode"]
 
 [[bin]]
 name = "ljosbru-gui"
-path = "src/bin/ljosbru-gui.rs"
+path = "src/bin/ljosbru-gui/main.rs"
 required-features = ["gui"]
 
 [dependencies]
@@ -58,6 +58,9 @@ rxing = { version = "0.9.3", default-features = false, features = [
 # xcap = { version = "0.9.4", optional = true }
 xcap = { git = "https://github.com/pavelzw/xcap", branch = "video-recorder-feature", default-features = false, optional = true }
 zstd = "0.14.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"

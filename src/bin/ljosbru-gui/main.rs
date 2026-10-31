@@ -14,10 +14,13 @@ use std::{
 use eframe::egui;
 use env_logger::Env;
 use image::RgbaImage;
+mod permissions;
+
 use ljosbru::{
     CacheStatus, DecodeConfig, DecodeEvent, DecodeOutcome, DecodeProgress, DecodeSummary,
     MonitorInfo, cache_status, list_monitors, parse_forward_key, run_decode,
 };
+use permissions::Permission;
 use serde::{Deserialize, Serialize};
 
 const SETTINGS_KEY: &str = "settings";
@@ -26,6 +29,8 @@ const PRIMARY_MONITOR_LABEL: &str = "Primary monitor";
 const PREVIEW_MAX_WIDTH: u32 = 1280;
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_LINES: usize = 500;
+const GRANTED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xa3, 0x4d);
+const PERMISSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn"))
@@ -153,6 +158,9 @@ struct DecodeApp {
     last_scan: Option<String>,
     preview: Option<egui::TextureHandle>,
     log: Vec<String>,
+    missing_permissions: Vec<Permission>,
+    permissions_checked_at: Instant,
+    show_permissions: bool,
 }
 
 impl DecodeApp {
@@ -171,7 +179,11 @@ impl DecodeApp {
             last_scan: None,
             preview: None,
             log: Vec::new(),
+            missing_permissions: permissions::missing(),
+            permissions_checked_at: Instant::now(),
+            show_permissions: false,
         };
+        app.show_permissions = !app.missing_permissions.is_empty();
         app.refresh_monitors();
         app.refresh_cache_status();
         app
@@ -184,6 +196,115 @@ impl DecodeApp {
     fn refresh_cache_status(&mut self) {
         self.cache_status = cache_status(&resolve_path(&self.settings.cache_dir))
             .map_err(|error| format!("{error:#}"));
+    }
+
+    /// Re-checks missing permissions while any are missing, since they are granted in System Settings.
+    fn poll_permissions(&mut self, ctx: &egui::Context) {
+        if self.missing_permissions.is_empty() {
+            return;
+        }
+        if self.permissions_checked_at.elapsed() >= PERMISSION_CHECK_INTERVAL {
+            self.missing_permissions = permissions::missing();
+            self.permissions_checked_at = Instant::now();
+            if self.missing_permissions.is_empty() {
+                self.show_permissions = false;
+                self.push_log("All required permissions are granted");
+            }
+        }
+        ctx.request_repaint_after(PERMISSION_CHECK_INTERVAL);
+    }
+
+    fn permissions_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_permissions {
+            return;
+        }
+        let response = egui::Modal::new(egui::Id::unique("permissions-modal")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading("Permissions needed");
+            ui.add_space(4.0);
+            ui.label("ljosbru needs these macOS permissions to decode.");
+            ui.add_space(12.0);
+            for permission in [Permission::ScreenRecording, Permission::Accessibility] {
+                let granted = !self.missing_permissions.contains(&permission);
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            let color = if granted {
+                                GRANTED_COLOR
+                            } else {
+                                ui.visuals().warn_fg_color
+                            };
+                            ui.painter().circle_filled(dot.center(), 5.0, color);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(permission.name()).strong(),
+                                    )
+                                    .extend(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "Needed {}.",
+                                            permission.purpose()
+                                        ))
+                                        .weak(),
+                                    )
+                                    .extend(),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if granted {
+                                        ui.colored_label(GRANTED_COLOR, "Granted");
+                                        return;
+                                    }
+                                    if ui.button("Open Settings…").clicked() {
+                                        permissions::request(permission);
+                                    }
+                                    if permissions::can_reset()
+                                        && ui
+                                            .button("Reset & retry")
+                                            .on_hover_text(
+                                                "Use this if ljosbru is already turned on in \
+                                                 System Settings but still shows as missing.",
+                                            )
+                                            .clicked()
+                                    {
+                                        permissions::reset_and_request(permission);
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Turn on ljosbru in the list that opens. After granting Screen Recording, \
+                     macOS may ask you to quit and reopen ljosbru. If ljosbru is already turned \
+                     on but still missing, it was approved for a different build: use Reset & \
+                     retry and turn it on again.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.button("Close").clicked()
+            })
+            .inner
+        });
+        if response.inner || response.should_close() {
+            self.show_permissions = false;
+        }
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -445,6 +566,25 @@ impl DecodeApp {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
 
+        if !self.missing_permissions.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let names = self
+                    .missing_permissions
+                    .iter()
+                    .map(|permission| permission.name())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Missing permission: {names}"),
+                );
+                if ui.small_button("Fix…").clicked() {
+                    self.show_permissions = true;
+                }
+            });
+        }
+
         ui.add_space(8.0);
         ui.separator();
         self.cache_status_ui(ui);
@@ -459,7 +599,11 @@ impl DecodeApp {
                 )
                 .clicked()
             {
-                self.start(ui.ctx());
+                if self.missing_permissions.is_empty() {
+                    self.start(ui.ctx());
+                } else {
+                    self.show_permissions = true;
+                }
             }
             if ui
                 .add_enabled(
@@ -602,6 +746,8 @@ impl eframe::App for DecodeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.process_messages(&ctx);
+        self.poll_permissions(&ctx);
+        self.permissions_modal(&ctx);
 
         egui::Panel::left("settings-panel")
             .resizable(false)
