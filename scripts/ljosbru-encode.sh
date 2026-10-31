@@ -36,8 +36,20 @@ die() {
   exit 1
 }
 
+# Each argument is "<command>:<conda-forge package>". Fails with a pixi exec
+# suggestion covering every missing command.
 require() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH"
+  local requirement missing=() specs="" invocation
+  for requirement in "$@"; do
+    if ! command -v "${requirement%%:*}" >/dev/null 2>&1; then
+      missing+=("${requirement%%:*}")
+      specs+=" -s ${requirement#*:}"
+    fi
+  done
+  ((${#missing[@]} == 0)) && return
+  invocation=$(printf "%q " "$0" ${original_args[@]+"${original_args[@]}"})
+  die "${missing[*]} not found in PATH; consider running
+  pixi exec$specs -- ${invocation% }"
 }
 
 # Write $2 as a big-endian unsigned integer of $1 bytes.
@@ -49,6 +61,7 @@ write_be() {
   printf '%b' "$escapes"
 }
 
+original_args=("$@")
 filename=""
 qr_size=""
 compression="none"
@@ -121,9 +134,9 @@ case "$wait_mode" in
   *) die "expected --wait to be \`auto\`, \`none\`, \`enter\`, or \`delay:<milliseconds>\`" ;;
 esac
 
-require qrencode
-require b3sum
-((compression_code == 0)) || require zstd
+requirements=(qrencode:libqrencode b3sum:b3sum)
+((compression_code == 0)) || requirements+=(zstd:zstd)
+require "${requirements[@]}"
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
