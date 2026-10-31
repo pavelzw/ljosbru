@@ -89,6 +89,21 @@ Useful encode options:
 | `--terminal` | Print terminal QR codes to stdout instead of writing PNG files. |
 | `--yes` | Delete existing PNGs in the output directory without prompting. |
 
+### Lightweight bash encoder
+
+[`scripts/ljosbru-encode.sh`](scripts/ljosbru-encode.sh) is a drop-in
+alternative to `ljosbru-encode` for environments where installing the Rust
+binary is not an option. It takes the same options and produces frames that
+`ljosbru-decode` and `ljosbru-gui` read. It needs `bash`, coreutils,
+[`qrencode`](https://fukuchi.org/works/qrencode/) and
+[`b3sum`](https://github.com/BLAKE3-team/BLAKE3), plus `zstd` for
+`--compression zstd`:
+
+```sh
+pixi global install -c conda-forge libqrencode b3sum zstd
+./scripts/ljosbru-encode.sh examples/input.bin --qr-size 600 --compression zstd:3 --terminal
+```
+
 ## Decode
 
 Show the generated QR images on a monitor, for example in a slide deck or image
