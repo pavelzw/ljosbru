@@ -5,8 +5,12 @@ platforms = ["osx-arm64", "linux-aarch64", "linux-64", "win-64"]
 exclude-newer = "7d"
 
 [tasks]
-build = "cargo build --features decode"
-test = "cargo test --features decode"
+build = "cargo build --features gui"
+test = "cargo test --features gui"
+gui = "cargo run --release --features gui --bin ljosbru-gui"
+
+[target.osx-arm64.tasks]
+bundle-macos = "bash scripts/macos/bundle-app.sh"
 
 [dependencies]
 rust = "*"

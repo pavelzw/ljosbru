@@ -1,13 +1,21 @@
 use std::ffi::OsStr;
 
+use anyhow::Context;
 use clap::Parser;
 use env_logger::Env;
 use ljosbru::{DecodeArgs, PrintMissingArgs, decode, print_missing};
 
 const PRINT_MISSING: &str = "print-missing";
+/// Set by `scripts/macos/ljosbru-decode-app`, since apps launched via `open` start in `/`.
+const WORKING_DIR_ENV: &str = "LJOSBRU_WORKING_DIR";
 
 fn main() -> anyhow::Result<()> {
     init_logger();
+
+    if let Some(dir) = std::env::var_os(WORKING_DIR_ENV) {
+        std::env::set_current_dir(&dir)
+            .with_context(|| format!("failed to change directory to {}", dir.display()))?;
+    }
 
     match CliCommand::parse() {
         CliCommand::Decode(args) => decode(args),

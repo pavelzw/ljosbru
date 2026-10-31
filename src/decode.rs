@@ -3,6 +3,7 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -35,7 +36,7 @@ pub struct DecodeArgs {
     #[arg(long, value_name = "milliseconds")]
     delay_between: u64,
 
-    #[arg(long, value_name = "key", value_parser = parse_enigo_key)]
+    #[arg(long, value_name = "key", value_parser = parse_forward_key)]
     forward_keypress: Key,
 
     #[arg(long, value_name = "directory")]
@@ -74,7 +75,8 @@ pub struct PrintMissingArgs {
     cache_dir: PathBuf,
 }
 
-fn parse_enigo_key(value: &str) -> anyhow::Result<Key> {
+/// Parses a forward key name, such as `Space`, `Tab`, or `RightArrow`.
+pub fn parse_forward_key(value: &str) -> anyhow::Result<Key> {
     let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value);
     Key::deserialize(deserializer)
         .context("expected a key name, such as `Space`, `Tab`, or `RightArrow`")
@@ -82,15 +84,148 @@ fn parse_enigo_key(value: &str) -> anyhow::Result<Key> {
 
 pub fn print_missing(args: PrintMissingArgs) -> anyhow::Result<()> {
     let store = FrameStore::load(&args.cache_dir)?;
-    let width = store.sequence_width()?;
-    for range in missing_sequence_ranges(&store.missing_sequences()?) {
-        println!("{}", format_sequence_range(range, width));
+    for range in store.missing_ranges()? {
+        println!("{range}");
     }
     Ok(())
 }
 
+/// Decode settings shared by the CLI and the GUI.
+#[derive(Debug, Clone)]
+pub struct DecodeConfig {
+    pub delay_between: Duration,
+    pub forward_keypress: Key,
+    pub cache_dir: PathBuf,
+    pub output: PathBuf,
+    pub monitor: Option<usize>,
+    pub initial_delay: Duration,
+    pub retry_timeout: Duration,
+    pub save_screenshots: bool,
+}
+
+impl From<DecodeArgs> for DecodeConfig {
+    fn from(args: DecodeArgs) -> Self {
+        Self {
+            delay_between: Duration::from_millis(args.delay_between),
+            forward_keypress: args.forward_keypress,
+            cache_dir: args.cache_dir,
+            output: args.output,
+            monitor: args.monitor,
+            initial_delay: Duration::from_millis(args.initial_delay),
+            retry_timeout: Duration::from_millis(args.retry_timeout),
+            save_screenshots: args.save_screenshots,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodeProgress {
+    pub cached_frames: usize,
+    /// Unknown until the first frame has been decoded.
+    pub total_frames: Option<u32>,
+    pub bytes_per_second: f64,
+    pub remaining_bytes: u64,
+}
+
+impl DecodeProgress {
+    fn new(store: &FrameStore, bytes_per_second: f64) -> Self {
+        let remaining_bytes = store
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .encoded_len
+                    .saturating_sub(store.cached_payload_bytes())
+            })
+            .unwrap_or_default();
+        Self {
+            cached_frames: store.frame_count(),
+            total_frames: store
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.total_chunks),
+            bytes_per_second,
+            remaining_bytes,
+        }
+    }
+
+    pub fn rate(&self) -> String {
+        human_bytes_per_second(self.bytes_per_second)
+    }
+
+    pub fn eta(&self) -> String {
+        human_eta(self.remaining_bytes, self.bytes_per_second)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodeSummary {
+    pub output: PathBuf,
+    pub original_len: u64,
+    pub total_chunks: u32,
+    pub sha256: String,
+}
+
+#[derive(Debug)]
+pub enum DecodeEvent<'a> {
+    /// The cache directory was loaded; emitted once before anything else.
+    CacheLoaded(DecodeProgress),
+    /// Time left of the initial delay, emitted roughly every 100 ms.
+    Countdown(Duration),
+    MonitorSelected {
+        index: usize,
+        description: &'a str,
+    },
+    Screenshot(&'a RgbaImage),
+    Scanned {
+        attempt: u64,
+        summary: String,
+    },
+    FrameCached {
+        sequence: u32,
+        progress: DecodeProgress,
+    },
+}
+
+#[derive(Debug)]
+pub enum DecodeOutcome {
+    Completed(DecodeSummary),
+    Cancelled,
+}
+
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub fn decode(args: DecodeArgs) -> anyhow::Result<()> {
-    let mut store = FrameStore::load(&args.cache_dir)?;
+    let config = DecodeConfig::from(args);
+    let mut progress_bar = None;
+    let outcome = run_decode(&config, &AtomicBool::new(false), |event| match event {
+        DecodeEvent::CacheLoaded(progress) | DecodeEvent::FrameCached { progress, .. } => {
+            update_decode_progress_bar(&mut progress_bar, &progress);
+        }
+        _ => {}
+    });
+    if let Some(progress_bar) = progress_bar.take() {
+        progress_bar.finish_and_clear();
+    }
+    if let DecodeOutcome::Completed(summary) = outcome? {
+        println!(
+            "Decoded {} byte(s) from {} QR code(s) into {}",
+            summary.original_len,
+            summary.total_chunks,
+            summary.output.display()
+        );
+        println!("SHA-256: {}", summary.sha256);
+    }
+    Ok(())
+}
+
+/// Runs the screenshot/keypress loop until every frame is cached or `cancel` is set.
+pub fn run_decode(
+    config: &DecodeConfig,
+    cancel: &AtomicBool,
+    mut on_event: impl FnMut(DecodeEvent<'_>),
+) -> anyhow::Result<DecodeOutcome> {
+    let mut store = FrameStore::load(&config.cache_dir)?;
     debug!(
         "Loaded {} cached QR frame(s){} from {}",
         store.frame_count(),
@@ -99,61 +234,86 @@ pub fn decode(args: DecodeArgs) -> anyhow::Result<()> {
             .as_ref()
             .map(|metadata| format!(" of {}", metadata.total_chunks))
             .unwrap_or_default(),
-        args.cache_dir.display()
+        config.cache_dir.display()
     );
+    on_event(DecodeEvent::CacheLoaded(DecodeProgress::new(&store, 0.0)));
 
     if store.is_complete() {
         debug!(
             "Cache is complete; writing decoded output to {}",
-            args.output.display()
+            config.output.display()
         );
-        let sha256 = write_reassembled_output(&store, &args.output)?;
-        print_summary(&store, &args.output, &sha256);
-        return Ok(());
+        return finish_decode(&store, &config.output);
     }
 
-    let mut progress = decode_progress_bar(&store)?;
-
-    debug!("Waiting {} ms before first screenshot", args.initial_delay);
-    thread::sleep(Duration::from_millis(args.initial_delay));
+    debug!(
+        "Waiting {} ms before first screenshot",
+        config.initial_delay.as_millis()
+    );
+    let countdown_started_at = Instant::now();
+    while let Some(remaining) = config
+        .initial_delay
+        .checked_sub(countdown_started_at.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(DecodeOutcome::Cancelled);
+        }
+        on_event(DecodeEvent::Countdown(remaining));
+        thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+    }
     let started_at = Instant::now();
     let initial_payload_bytes = store.cached_payload_bytes();
 
-    let selected_monitor = select_monitor(args.monitor)?;
+    let selected_monitor = select_monitor(config.monitor)?;
     debug!(
         "Using monitor {} ({})",
         selected_monitor.index, selected_monitor.description
     );
+    on_event(DecodeEvent::MonitorSelected {
+        index: selected_monitor.index,
+        description: &selected_monitor.description,
+    });
     let mut enigo =
         Enigo::new(&Settings::default()).context("failed to initialize keyboard input")?;
-    let retry_timeout = Duration::from_millis(args.retry_timeout);
-    let delay_between = Duration::from_millis(args.delay_between);
     let screenshot_options = ScreenshotOptions {
-        cache_dir: &args.cache_dir,
-        save_screenshots: args.save_screenshots,
+        cache_dir: &config.cache_dir,
+        save_screenshots: config.save_screenshots,
     };
     let mut scanner = RxingScanner::new();
     let mut capture = CaptureContext {
         monitor: &selected_monitor.monitor,
         scanner: &mut scanner,
         screenshot_options,
+        on_event: &mut on_event,
     };
     let mut previous_sequence = None;
 
     loop {
-        let frame = wait_for_frame(
+        let Some(frame) = wait_for_frame(
             &mut capture,
-            retry_timeout,
-            delay_between,
+            cancel,
+            config.retry_timeout,
+            config.delay_between,
             previous_sequence,
             &store,
-        )?;
+        )?
+        else {
+            return Ok(DecodeOutcome::Cancelled);
+        };
         let sequence = frame.sequence;
         let total_chunks = frame.total_chunks;
         previous_sequence = Some(frame.sequence);
-        let status = store.cache_frame(&args.cache_dir, frame)?;
-        ensure_decode_progress_bar(&mut progress, &store)?;
-        update_decode_progress_bar(&progress, &store, initial_payload_bytes, &started_at);
+        let status = store.cache_frame(&config.cache_dir, frame)?;
+        let decoded_bytes = store
+            .cached_payload_bytes()
+            .saturating_sub(initial_payload_bytes);
+        let bytes_per_second =
+            decoded_bytes as f64 / started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        (capture.on_event)(DecodeEvent::FrameCached {
+            sequence,
+            progress: DecodeProgress::new(&store, bytes_per_second),
+        });
         debug!(
             "{} QR frame {sequence}/{total_chunks}; cache now has {} frame(s)",
             status.log_label(),
@@ -161,92 +321,121 @@ pub fn decode(args: DecodeArgs) -> anyhow::Result<()> {
         );
 
         if store.is_complete() {
-            if let Some(progress) = progress.take() {
-                progress.finish_and_clear();
-            }
             debug!(
                 "All QR frames are cached; writing decoded output to {}",
-                args.output.display()
+                config.output.display()
             );
-            let sha256 = write_reassembled_output(&store, &args.output)?;
-            print_summary(&store, &args.output, &sha256);
-            return Ok(());
+            return finish_decode(&store, &config.output);
         }
 
         debug!(
             "Pressing {:?}, then waiting {} ms",
-            args.forward_keypress, args.delay_between
+            config.forward_keypress,
+            config.delay_between.as_millis()
         );
         enigo
-            .key(args.forward_keypress, Direction::Click)
-            .context("failed to press --forward-keypress")?;
-        thread::sleep(delay_between);
+            .key(config.forward_keypress, Direction::Click)
+            .context("failed to press the forward key")?;
+        if !sleep_unless_cancelled(config.delay_between, cancel) {
+            return Ok(DecodeOutcome::Cancelled);
+        }
     }
 }
 
-fn print_summary(store: &FrameStore, output: &Path, sha256: &str) {
-    if let Some(metadata) = &store.metadata {
-        println!(
-            "Decoded {} byte(s) from {} QR code(s) into {}",
-            metadata.original_len,
-            metadata.total_chunks,
-            output.display()
-        );
-        println!("SHA-256: {sha256}");
+/// Returns `false` if `cancel` was set while sleeping.
+fn sleep_unless_cancelled(duration: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
     }
 }
 
-fn decode_progress_bar(store: &FrameStore) -> anyhow::Result<Option<ProgressBar>> {
-    let Some(metadata) = &store.metadata else {
-        return Ok(None);
+fn finish_decode(store: &FrameStore, output: &Path) -> anyhow::Result<DecodeOutcome> {
+    let sha256 = write_reassembled_output(store, output)?;
+    let metadata = store
+        .metadata
+        .as_ref()
+        .context("no QR frames have been decoded")?;
+    Ok(DecodeOutcome::Completed(DecodeSummary {
+        output: output.to_owned(),
+        original_len: metadata.original_len,
+        total_chunks: metadata.total_chunks,
+        sha256,
+    }))
+}
+
+fn update_decode_progress_bar(progress_bar: &mut Option<ProgressBar>, progress: &DecodeProgress) {
+    let Some(total_frames) = progress.total_frames else {
+        return;
     };
-
-    let progress = ProgressBar::new(u64::from(metadata.total_chunks));
-    progress.set_style(
-        ProgressStyle::with_template(
-            "Decoding QR codes [{bar:40.cyan/blue}] {pos}/{len} {msg} ({elapsed_precise})",
-        )
-        .context("failed to configure progress bar")?
-        .progress_chars("##-"),
-    );
-    progress.set_position(store.frame_count() as u64);
-    progress.set_message("0 B/s ETA --:--");
-    Ok(Some(progress))
+    let progress_bar = progress_bar.get_or_insert_with(|| {
+        let progress_bar = ProgressBar::new(u64::from(total_frames));
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "Decoding QR codes [{bar:40.cyan/blue}] {pos}/{len} {msg} ({elapsed_precise})",
+            )
+            .expect("progress bar template is valid")
+            .progress_chars("##-"),
+        );
+        progress_bar
+    });
+    progress_bar.set_position(progress.cached_frames as u64);
+    progress_bar.set_message(format!("{} ETA {}", progress.rate(), progress.eta()));
 }
 
-fn ensure_decode_progress_bar(
-    progress: &mut Option<ProgressBar>,
-    store: &FrameStore,
-) -> anyhow::Result<()> {
-    if progress.is_none() {
-        *progress = decode_progress_bar(store)?;
+/// Cached frame counts of a cache directory, for showing resume state.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStatus {
+    pub cached_frames: usize,
+    pub total_frames: Option<u32>,
+    /// Missing frame IDs grouped into ranges, as printed by `print-missing`.
+    pub missing_ranges: Vec<String>,
+}
+
+pub fn cache_status(cache_dir: &Path) -> anyhow::Result<CacheStatus> {
+    if !cache_dir.is_dir() {
+        return Ok(CacheStatus::default());
     }
-    Ok(())
-}
-
-fn update_decode_progress_bar(
-    progress: &Option<ProgressBar>,
-    store: &FrameStore,
-    initial_payload_bytes: u64,
-    started_at: &Instant,
-) {
-    if let Some(progress) = progress {
-        let cached_payload_bytes = store.cached_payload_bytes();
-        let decoded_bytes = cached_payload_bytes.saturating_sub(initial_payload_bytes);
-        let bytes_per_second =
-            decoded_bytes as f64 / started_at.elapsed().as_secs_f64().max(f64::EPSILON);
-        let remaining_bytes = store
+    let store = FrameStore::load(cache_dir)?;
+    Ok(CacheStatus {
+        cached_frames: store.frame_count(),
+        total_frames: store
             .metadata
             .as_ref()
-            .map(|metadata| metadata.encoded_len.saturating_sub(cached_payload_bytes))
-            .unwrap_or_default();
-        progress.set_position(store.frame_count() as u64);
-        progress.set_message(format!(
-            "{} ETA {}",
-            human_bytes_per_second(bytes_per_second),
-            human_eta(remaining_bytes, bytes_per_second)
-        ));
-    }
+            .map(|metadata| metadata.total_chunks),
+        missing_ranges: if store.metadata.is_some() {
+            store.missing_ranges()?
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorInfo {
+    pub index: usize,
+    pub description: String,
+    pub is_primary: bool,
+}
+
+pub fn list_monitors() -> anyhow::Result<Vec<MonitorInfo>> {
+    Ok(Monitor::all()
+        .context("failed to enumerate monitors")?
+        .iter()
+        .enumerate()
+        .map(|(index, monitor)| MonitorInfo {
+            index,
+            description: monitor_description(monitor),
+            is_primary: monitor.is_primary().unwrap_or(false),
+        })
+        .collect())
 }
 
 struct SelectedMonitor {
@@ -311,13 +500,15 @@ fn monitor_description(monitor: &Monitor) -> String {
     format!("{name}, {width}x{height}{primary}")
 }
 
+/// Returns `None` if `cancel` was set while waiting.
 fn wait_for_frame(
     capture: &mut CaptureContext<'_>,
+    cancel: &AtomicBool,
     retry_timeout: Duration,
     retry_interval: Duration,
     previous_sequence: Option<u32>,
     store: &FrameStore,
-) -> anyhow::Result<Frame> {
+) -> anyhow::Result<Option<Frame>> {
     let started_at = Instant::now();
     let retry_interval = if retry_interval.is_zero() {
         Duration::from_millis(100)
@@ -327,6 +518,9 @@ fn wait_for_frame(
     let mut attempts = 0_u64;
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         attempts += 1;
         let frames = capture.capture_ljosbru_frames()?;
         let mut usable_frames = Vec::new();
@@ -347,12 +541,16 @@ fn wait_for_frame(
             usable_count: usable_frames.len(),
         };
         debug!("screenshot attempt {attempts}: {observation}");
+        (capture.on_event)(DecodeEvent::Scanned {
+            attempt: attempts,
+            summary: observation.to_string(),
+        });
 
         usable_frames.sort_by_key(|frame| frame.sequence);
         usable_frames.dedup();
         match usable_frames.len() {
             0 => {}
-            1 => return Ok(usable_frames.remove(0)),
+            1 => return Ok(Some(usable_frames.remove(0))),
             _ => bail!("found multiple ljosbru QR codes on the selected monitor"),
         }
 
@@ -372,7 +570,9 @@ fn wait_for_frame(
             );
         }
 
-        thread::sleep(retry_interval);
+        if !sleep_unless_cancelled(retry_interval, cancel) {
+            return Ok(None);
+        }
     }
 }
 
@@ -415,6 +615,7 @@ struct CaptureContext<'a> {
     monitor: &'a Monitor,
     scanner: &'a mut RxingScanner,
     screenshot_options: ScreenshotOptions<'a>,
+    on_event: &'a mut dyn FnMut(DecodeEvent<'_>),
 }
 
 impl CaptureContext<'_> {
@@ -430,6 +631,7 @@ impl CaptureContext<'_> {
                 .with_context(|| format!("failed to save screenshot {}", path.display()))?;
             debug!("saved screenshot {}", path.display());
         }
+        (self.on_event)(DecodeEvent::Screenshot(&screenshot));
 
         self.scanner.decode_ljosbru_frames(screenshot)
     }
@@ -475,7 +677,8 @@ impl RxingScanner {
         let width = screenshot.width();
         let height = screenshot.height();
         let image = DynamicImage::ImageRgba8(screenshot).to_luma8();
-        let source = Luma8LuminanceSource::new(image.into_raw(), width, height);
+        let source = Luma8LuminanceSource::new(image.into_raw(), width, height)
+            .context("failed to create luminance source from screenshot")?;
         let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
         let results = match self
             .reader
@@ -709,6 +912,14 @@ impl FrameStore {
             .context("no QR frames have been decoded")?;
         Ok((1..=metadata.total_chunks)
             .filter(|sequence| !self.frames.contains_key(sequence))
+            .collect())
+    }
+
+    fn missing_ranges(&self) -> anyhow::Result<Vec<String>> {
+        let width = self.sequence_width()?;
+        Ok(missing_sequence_ranges(&self.missing_sequences()?)
+            .into_iter()
+            .map(|range| format_sequence_range(range, width))
             .collect())
     }
 
@@ -968,6 +1179,84 @@ mod tests {
         assert_eq!(args.initial_delay, 2_000);
         assert_eq!(args.retry_timeout, 1_000);
         assert!(args.save_screenshots);
+    }
+
+    fn test_decode_config(cache_dir: &Path) -> DecodeConfig {
+        DecodeConfig {
+            delay_between: Duration::ZERO,
+            forward_keypress: Key::RightArrow,
+            cache_dir: cache_dir.to_owned(),
+            output: cache_dir.join("out.bin"),
+            monitor: None,
+            initial_delay: Duration::from_secs(60),
+            retry_timeout: Duration::from_secs(60),
+            save_screenshots: false,
+        }
+    }
+
+    #[test]
+    fn run_decode_stops_during_initial_delay_when_cancelled() {
+        let cache = tempfile::tempdir().unwrap();
+        let config = test_decode_config(cache.path());
+        let mut events = Vec::new();
+
+        let outcome = run_decode(&config, &AtomicBool::new(true), |event| {
+            events.push(format!("{event:?}"));
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, DecodeOutcome::Cancelled));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("CacheLoaded"));
+    }
+
+    #[test]
+    fn run_decode_writes_output_from_complete_cache_without_capturing() {
+        let cache = tempfile::tempdir().unwrap();
+        let data = b"hello ljosbru";
+        FrameStore::default()
+            .cache_frame(
+                cache.path(),
+                test_frame(1, 1, data.len() as u64, data, data, FrameCompression::None),
+            )
+            .unwrap();
+        let config = test_decode_config(cache.path());
+
+        let outcome = run_decode(&config, &AtomicBool::new(false), |_| {}).unwrap();
+
+        let DecodeOutcome::Completed(summary) = outcome else {
+            panic!("expected a completed decode");
+        };
+        assert_eq!(summary.total_chunks, 1);
+        assert_eq!(summary.sha256, sha256_hex(data));
+        assert_eq!(fs::read(&config.output).unwrap(), data);
+    }
+
+    #[test]
+    fn cache_status_reports_missing_ranges() {
+        let cache = tempfile::tempdir().unwrap();
+        assert_eq!(
+            cache_status(&cache.path().join("missing"))
+                .unwrap()
+                .total_frames,
+            None
+        );
+
+        let encoded = b"abcdef";
+        let mut store = FrameStore::default();
+        for (sequence, chunk) in [(1, b"ab"), (3, b"ef")] {
+            store
+                .cache_frame(
+                    cache.path(),
+                    test_frame(sequence, 3, 6, encoded, chunk, FrameCompression::None),
+                )
+                .unwrap();
+        }
+
+        let status = cache_status(cache.path()).unwrap();
+        assert_eq!(status.cached_frames, 2);
+        assert_eq!(status.total_frames, Some(3));
+        assert_eq!(status.missing_ranges, vec!["000002"]);
     }
 
     #[test]

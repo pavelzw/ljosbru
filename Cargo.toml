@@ -1,12 +1,13 @@
 [package]
 name = "ljosbru"
 description = "Transfer data through QR codes"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 [features]
 default = []
 decode = ["dep:enigo", "dep:serde", "dep:sha2", "dep:xcap", "dep:rxing"]
+gui = ["decode", "serde/derive", "dep:core-foundation", "dep:eframe", "dep:rfd"]
 
 [[bin]]
 name = "ljosbru-encode"
@@ -17,28 +18,49 @@ name = "ljosbru-decode"
 path = "src/bin/ljosbru-decode.rs"
 required-features = ["decode"]
 
+[[bin]]
+name = "ljosbru-gui"
+path = "src/bin/ljosbru-gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
-anyhow = "1.0.102"
-blake3 = "1.5.5"
-clap = { version = "4.6.1", features = ["derive"] }
-env_logger = "0.11.8"
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+eframe = { version = "0.37.0", default-features = false, features = [
+  "accesskit",
+  "clipboard",
+  "default_fonts",
+  "glow",
+  "persistence",
+  "wayland",
+  "x11",
+], optional = true }
+clap = { version = "4.6.7", features = ["derive"] }
+env_logger = "0.11.11"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 human_bytes = "0.4.3"
-indicatif = "0.18.4"
-log = "0.4.29"
+indicatif = "0.18.6"
+log = "0.4.35"
 rayon = "1.12.0"
-serde = { version = "1.0.228", optional = true }
-sha2 = { version = "0.10.9", optional = true }
-thiserror = "2.0.18"
+serde = { version = "1.0.229", optional = true }
+sha2 = { version = "0.11.1", optional = true }
+thiserror = "2.0.21"
 enigo = { version = "0.6.1", features = ["serde"], optional = true }
+rfd = { version = "0.17.2", optional = true }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
-rxing = { version = "0.8.6", default-features = false, features = [
+rxing = { version = "0.9.3", default-features = false, features = [
   "encoding_rs",
+  "decoders",
+  "multi_barcode_readers",
+  "qrcode",
 ], optional = true }
 # https://github.com/nashaofu/xcap/issues/275
 # xcap = { version = "0.9.4", optional = true }
 xcap = { git = "https://github.com/pavelzw/xcap", branch = "video-recorder-feature", default-features = false, optional = true }
-zstd = "0.13.3"
+zstd = "0.14.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10.1", optional = true }
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = "3.27.0"

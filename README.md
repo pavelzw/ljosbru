@@ -126,7 +126,40 @@ The decode progress bar shows cached frame count, payload bytes per second, ETA,
 and elapsed time.
 
 On macOS, decoding may require Screen Recording permission for screenshots and
-Accessibility permission for automated keypresses.
+Accessibility permission for automated keypresses. When `ljosbru-decode` is run
+from a terminal, macOS attributes these permissions to the terminal app (e.g.
+Ghostty or Terminal.app), so every program run from it gets them. Use the
+[decode GUI](#decode-gui) to grant them to ljosbru only.
+
+## Decode GUI
+
+`ljosbru-gui` is a desktop app for decoding. It has the same options as
+`ljosbru-decode`, shows a live preview of the captured screen, progress and ETA,
+and which frames are still missing from the cache. Settings are remembered
+between runs, and stopping and starting again resumes from the cache.
+
+```sh
+pixi run gui
+# or
+cargo run --release --features gui --bin ljosbru-gui
+```
+
+After pressing Start, bring the window showing the QR codes to the front before
+the initial delay runs out so that it receives the forward key. By default the
+GUI minimizes itself while decoding and comes back when it is done.
+
+On macOS, build it as an app bundle so the Screen Recording and Accessibility
+permissions belong to ljosbru instead of your terminal:
+
+```sh
+pixi run bundle-macos  # or: scripts/macos/bundle-app.sh
+open target/release/ljosbru.app
+```
+
+The bundle is ad-hoc signed by default, so macOS asks again after every rebuild.
+Set `CODESIGN_IDENTITY` to a signing identity from
+`security find-identity -v -p codesigning` to keep the permissions across
+rebuilds.
 
 ## Resume And Inspect Missing Frames
 
@@ -169,6 +202,6 @@ Try a longer `--initial-delay`, a larger `--delay-between`, a different
 
 ```sh
 cargo fmt
-cargo test --features decode
+cargo test --features gui
 cargo clippy --all-targets --all-features -- -D warnings
 ```
