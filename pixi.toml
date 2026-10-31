@@ -8,6 +8,9 @@ exclude-newer = "7d"
 build = "cargo build --features decode"
 test = "cargo test --features decode"
 
+[target.osx-arm64.tasks]
+bundle-macos = "bash scripts/macos/bundle-app.sh"
+
 [dependencies]
 rust = "*"
 pkg-config = "*"

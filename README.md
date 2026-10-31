@@ -126,7 +126,26 @@ The decode progress bar shows cached frame count, payload bytes per second, ETA,
 and elapsed time.
 
 On macOS, decoding may require Screen Recording permission for screenshots and
-Accessibility permission for automated keypresses.
+Accessibility permission for automated keypresses. When `ljosbru-decode` is run
+directly from a terminal, macOS attributes these permissions to the terminal app
+(e.g. Ghostty or Terminal.app), so every program run from it gets them. To grant
+them to `ljosbru-decode` only, build it as an app bundle and run it through the
+launcher script:
+
+```sh
+pixi run bundle-macos  # or: scripts/macos/bundle-app.sh
+scripts/macos/ljosbru-decode-app \
+  --delay-between 100 \
+  --forward-keypress RightArrow \
+  --cache-dir ljosbru-cache \
+  --output output.bin
+```
+
+The launcher accepts the same arguments as `ljosbru-decode` and resolves relative
+paths against the current directory. The bundle is ad-hoc signed by default, so
+macOS asks again after every rebuild; set `CODESIGN_IDENTITY` to a signing
+identity from `security find-identity -v -p codesigning` to keep the permissions
+across rebuilds.
 
 ## Resume And Inspect Missing Frames
 

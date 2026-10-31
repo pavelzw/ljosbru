@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Run ljosbru-decode.app from a terminal. The app is launched through
+# LaunchServices so macOS asks for permissions on behalf of ljosbru-decode
+# instead of the terminal, while I/O stays attached to the current terminal.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+app="${LJOSBRU_DECODE_APP:-$repo_root/target/release/ljosbru-decode.app}"
+
+if [[ ! -d "$app" ]]; then
+  echo "error: $app not found, build it with scripts/macos/bundle-app.sh" >&2
+  exit 1
+fi
+
+if ! terminal="$(tty)"; then
+  echo "error: ljosbru-decode-app must be run from a terminal" >&2
+  exit 1
+fi
+
+open_args=(
+  -n -W -a "$app"
+  --stdin "$terminal" --stdout "$terminal" --stderr "$terminal"
+  --env "LJOSBRU_WORKING_DIR=$PWD"
+)
+if [[ -n "${RUST_LOG:-}" ]]; then
+  open_args+=(--env "RUST_LOG=$RUST_LOG")
+fi
+
+# The app runs outside this terminal's process group, so forward Ctrl+C.
+trap 'pkill -INT -f "^$app/Contents/MacOS/ljosbru-decode" || true; exit 130' INT TERM
+
+# `open -W` complains when the app exits before it can attach; that is harmless.
+open "${open_args[@]}" --args "$@" 2> >(grep -v "Unable to block on application" >&2)
