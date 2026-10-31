@@ -7,6 +7,7 @@ edition = "2024"
 [features]
 default = []
 decode = ["dep:enigo", "dep:serde", "dep:sha2", "dep:xcap", "dep:rxing"]
+gui = ["decode", "serde/derive", "dep:eframe", "dep:rfd"]
 
 [[bin]]
 name = "ljosbru-encode"
@@ -17,9 +18,23 @@ name = "ljosbru-decode"
 path = "src/bin/ljosbru-decode.rs"
 required-features = ["decode"]
 
+[[bin]]
+name = "ljosbru-gui"
+path = "src/bin/ljosbru-gui.rs"
+required-features = ["gui"]
+
 [dependencies]
 anyhow = "1.0.104"
 blake3 = "1.8.7"
+eframe = { version = "0.37.0", default-features = false, features = [
+  "accesskit",
+  "clipboard",
+  "default_fonts",
+  "glow",
+  "persistence",
+  "wayland",
+  "x11",
+], optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
 env_logger = "0.11.11"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -31,6 +46,7 @@ serde = { version = "1.0.229", optional = true }
 sha2 = { version = "0.11.1", optional = true }
 thiserror = "2.0.21"
 enigo = { version = "0.6.1", features = ["serde"], optional = true }
+rfd = { version = "0.17.2", optional = true }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 rxing = { version = "0.9.3", default-features = false, features = [
   "encoding_rs",
